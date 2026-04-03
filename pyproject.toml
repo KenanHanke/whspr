@@ -1,0 +1,34 @@
+
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+
+[project]
+name = "whspr"
+version = "0.1.0"
+authors = [{ name = "Kenan Hanke" }]
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+dependencies = []
+
+[project.optional-dependencies]
+gpu = [
+    "faster-whisper>=1.1,<2",
+    "nvidia-cublas-cu12>=12,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu12>=9,<10; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
+[project.scripts]
+whspr = "whspr.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whspr"]
+
+[tool.hatch.build]
+dev-mode-dirs = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/whspr", "/README.md"]
