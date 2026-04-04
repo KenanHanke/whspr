@@ -1,24 +1,8 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+from . import client
 
-from ._cuda_bootstrap import ensure_cuda_runtime_loaded
-
-ensure_cuda_runtime_loaded()
-
-from faster_whisper import WhisperModel
-
-model = WhisperModel(
-    "turbo",
-    device="cuda",
-    compute_type="float16",
-)
-
-def transcribe(path) -> str:
-    segments, info = model.transcribe(path)
-    text = "".join(seg.text for seg in segments)
-    return text
-
-def main() -> None:
-    ...
+def main():
+    client.main()
 
 if __name__ == "__main__":
     main()
