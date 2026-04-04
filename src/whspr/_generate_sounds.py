@@ -19,7 +19,7 @@ def main():
     F2_whole = synth_guitar_note(87.31, length)
 
     start_sound = C3_half + G3_half
-    end_sound = G3_half + C3_half
+    stop_sound = G3_half + C3_half
     finished_sound = C4_whole
     cancelled_sound = F2_whole
 
@@ -27,13 +27,13 @@ def main():
     os.makedirs(sounds_dir, exist_ok=True)
 
     write_wav(os.path.join(sounds_dir, "start.wav"), start_sound)
-    write_wav(os.path.join(sounds_dir, "end.wav"), end_sound)
+    write_wav(os.path.join(sounds_dir, "stop.wav"), stop_sound)
     write_wav(os.path.join(sounds_dir, "finished.wav"), finished_sound)
     write_wav(os.path.join(sounds_dir, "cancelled.wav"), cancelled_sound)
 
     # Finally, play all the sounds using aplay (Linux), each time
     # prompting the user to press Enter to continue.
-    for name in ["start", "end", "finished", "cancelled"]:
+    for name in ["start", "stop", "finished", "cancelled"]:
         input(f"Press enter to play {name}.wav...")
         os.system(f"aplay {os.path.join(sounds_dir, name + '.wav')}")
 
