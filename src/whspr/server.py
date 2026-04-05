@@ -271,8 +271,15 @@ def transcribe_helper(path, model):
     segments, info = model.transcribe(path)
     text = "".join(seg.text for seg in segments)
     
-    # remove common hallucination
-    text = text.replace(" Thank you.", "").replace("Thank you. ", "").replace("Thank you.", "")
+    # remove common hallucinations
+    hallucinations = [
+        "Thank you.",
+        "Hello, I know I'll be right back.",
+    ]
+    for hallucination in hallucinations:
+        text = text.replace(" " + hallucination, "")
+        text = text.replace(hallucination + " ", "")
+        text = text.replace(hallucination, "")
     
     text = text.strip()
     return text
