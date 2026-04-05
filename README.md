@@ -7,9 +7,9 @@ An interactive dictation software package for Linux optimized for low latency an
 Bind the following commands to your preferred keyboard shortcuts (examples given here).
 
 ```bash
-whspr          # Super+C
-whspr --paste  # Super+V
-whspr --cancel # Super+X
+whspr            # Super+C
+whspr --paste    # Super+V
+whspr --cancel   # Super+X
 ```
 
 In the example given, `Super+C` and `Super+V` will both start or stop dictation and copy the
