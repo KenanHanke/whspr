@@ -24,7 +24,7 @@ Sounds will indicate when `whspr` is listening and when it has finished processi
 - the `aplay`, `arecord`, `ydotool` commands. The former two are part of the
   `alsa-utils` package and installed on most systems already. `ydotool` is optional
   and only required for the `--paste` option (see [Usage](#usage)).
-- a clipboard backend compatible with `pyperclip` to be available, e.g. `wl-clipboard` on Wayland or `xclip` on X11.
+- a clipboard backend compatible with `pyperclip`, e.g. `wl-clipboard` on Wayland or `xclip` on X11.
 - for optional local speech recognition, an Nvidia GPU and drivers are required.
 
 On Ubuntu, run:
