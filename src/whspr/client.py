@@ -1,7 +1,7 @@
-# linux_speech_io.py
+# src/whspr/client.py
 """
-Small Linux-only helpers for a speech-recognition workflow built around
-`arecord`, `aplay`, a Unix domain socket, and a lock file.
+Small Linux-only recording client for a speech-recognition workflow built
+around `arecord`, `aplay`, a Unix domain socket, and a lock file.
 
 Expected flow:
 1) One process acquires the lock and calls `record_until_stop()`.
@@ -9,6 +9,8 @@ Expected flow:
    `stop_transcribe_copy_and_notify()`.
 3) The recorder receives the stop request over the Unix socket, stops
    `arecord`, finalizes the WAV file, and replies that the recording is ready.
+4) The second process waits for the ready reply, then transcribes the recording
+    and copies the transcript to the clipboard while playing a sound.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from . import server
 START_SOUND = str(files("whspr").joinpath("data/sounds/start.wav"))
 STOP_SOUND = str(files("whspr").joinpath("data/sounds/stop.wav"))
 FINISHED_SOUND = str(files("whspr").joinpath("data/sounds/finished.wav"))
+CANCELLED_SOUND = str(files("whspr").joinpath("data/sounds/cancelled.wav"))
 
 RECORDING_PATH = "/tmp/whspr-recording.wav"
 SOCKET_PATH = "/tmp/whspr-recorder.sock"
@@ -67,7 +70,7 @@ def _raise_process_error(name: str, proc: subprocess.Popen[str]) -> None:
     raise RuntimeError(message)
 
 
-def _play_wav_blocking(path: str) -> None:
+def play_wav_blocking(path: str) -> None:
     """Play a WAV file and wait until playback finishes."""
     proc = subprocess.run(
         ["aplay", "-q", path],
@@ -83,7 +86,7 @@ def _play_wav_blocking(path: str) -> None:
         raise RuntimeError(message)
 
 
-def _play_wav_background(path: str) -> subprocess.Popen[str]:
+def play_wav_background(path: str) -> subprocess.Popen[str]:
     """Play a WAV file in the background and return the running process."""
     return subprocess.Popen(
         ["aplay", "-q", path],
@@ -175,6 +178,20 @@ def _ensure_recording_exists(recording_path: str) -> None:
         raise RuntimeError(f"Recording file looks empty: {recording_path}")
 
 
+def _paste_with_ydotool() -> None:
+    try:
+        subprocess.Popen(
+            ["ydotool", "key", "ctrl+v"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def record_until_stop() -> str:
     """
     Play `start_sound`, then start continuously recording microphone audio to
@@ -186,7 +203,7 @@ def record_until_stop() -> str:
 
     Returns the recording path once the file is ready.
     """
-    _play_wav_blocking(START_SOUND)
+    play_wav_blocking(START_SOUND)
 
     _unlink_if_exists(SOCKET_PATH)
     Path(RECORDING_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -286,7 +303,12 @@ def request_stop_and_wait(
     ) from last_error
 
 
-def stop_transcribe_copy_and_notify():
+def cancel_recording():
+    request_stop_and_wait()
+    play_wav_blocking(CANCELLED_SOUND)
+
+
+def stop_transcribe_copy_and_notify(paste=False):
     """
     1) Call `request_stop_and_wait()`.
     2) Start playing `stop_sound` in the background.
@@ -297,17 +319,19 @@ def stop_transcribe_copy_and_notify():
     """
     request_stop_and_wait()
     
-    stop_proc = _play_wav_background(STOP_SOUND)
+    stop_proc = play_wav_background(STOP_SOUND)
     try:
         transcript = str(server.transcribe(RECORDING_PATH))
         pyperclip.copy(transcript)
     finally:
         _wait_for_success("aplay", stop_proc)
 
-    _play_wav_blocking(FINISHED_SOUND)
+    if paste:
+        _paste_with_ydotool()
+    play_wav_blocking(FINISHED_SOUND)
 
 
-def main():
+def main(paste=False):
     """
     Try to acquire an exclusive non-blocking lock on `lock_path`.
 
@@ -327,7 +351,7 @@ def main():
             if exc.errno not in (errno.EACCES, errno.EAGAIN):
                 raise
 
-            stop_transcribe_copy_and_notify()
+            stop_transcribe_copy_and_notify(paste)
             return
 
         try:
