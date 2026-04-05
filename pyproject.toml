@@ -12,7 +12,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
-dependencies = ["pyperclip", "av"]
+dependencies = ["pyperclip"]
 classifiers = ["Operating System :: POSIX :: Linux"]
 
 
