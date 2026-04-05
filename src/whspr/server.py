@@ -270,7 +270,12 @@ def load_model():
 def transcribe_helper(path, model):
     segments, info = model.transcribe(path)
     text = "".join(seg.text for seg in segments)
-    return text.strip()
+    
+    # remove common hallucination
+    text = text.replace(" Thank you.", "").replace("Thank you. ", "").replace("Thank you.", "")
+    
+    text = text.strip()
+    return text
 
 
 if __name__ == "__main__":
