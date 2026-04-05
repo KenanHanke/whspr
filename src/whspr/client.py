@@ -304,6 +304,19 @@ def request_stop_and_wait(
 
 
 def cancel_recording():
+    try:
+        with open(LOCK_PATH, "a+") as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # This means the lock is held by a recording process, so we can proceed to cancel it.
+                pass
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                return
+    except OSError:
+        return
+
     request_stop_and_wait()
     play_wav_blocking(CANCELLED_SOUND)
 
