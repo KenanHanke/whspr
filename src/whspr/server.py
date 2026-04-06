@@ -253,17 +253,21 @@ def transcribe(path):
 
 
 def load_model():
-    from ._cuda_bootstrap import ensure_cuda_runtime_loaded
-
-    ensure_cuda_runtime_loaded()
-
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(
-        "turbo",
-        device="cuda",
-        compute_type="float16",
-    )
+    try:
+        from ._cuda_bootstrap import ensure_cuda_runtime_loaded
+        ensure_cuda_runtime_loaded()
+        model = WhisperModel(
+            "turbo",
+            device="cuda",
+            compute_type="float16",
+        )
+    except Exception:
+        model = WhisperModel(
+            "small.en",
+            compute_type="int8",
+        )
     return model
 
 

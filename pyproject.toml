@@ -6,22 +6,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "whspr"
-version = "0.1.0"
+version = "1.0.0"
 authors = [{ name = "Kenan Hanke" }]
+description = "An interactive dictation tool for local speech recognition using OpenAI's Whisper models."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
-dependencies = ["pyperclip"]
+dependencies = ["faster-whisper>=1.1,<2", "pyperclip"]
 classifiers = ["Operating System :: POSIX :: Linux"]
 
 
 [project.optional-dependencies]
-gpu = [
-    "faster-whisper>=1.1,<2",
-    "nvidia-cublas-cu12>=12,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "nvidia-cudnn-cu12>=9,<10; platform_system == 'Linux' and platform_machine == 'x86_64'",
-]
+gpu = ["nvidia-cublas-cu12>=12.6,<13", "nvidia-cudnn-cu12>=9.6,<10"]
 
 [project.scripts]
 whspr = "whspr.__main__:main"
