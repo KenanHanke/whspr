@@ -259,7 +259,7 @@ def load_model():
         from ._cuda_bootstrap import ensure_cuda_runtime_loaded
         ensure_cuda_runtime_loaded()
         model = WhisperModel(
-            "turbo",
+            "large-v3-turbo",
             device="cuda",
             compute_type="float16",
         )

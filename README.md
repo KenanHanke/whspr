@@ -5,9 +5,9 @@ Its interface is fully keyboard-driven and sound-based so as not to interfere wi
 windowing or application focus.
 
 Processing is done locally using `faster-whisper`. If `whspr[gpu]` optional dependencies
-are installed and an Nvidia GPU is available, the current version of `whisper-large-turbo`
+are installed and an Nvidia GPU is available, the model `whisper-large-v3-turbo`
 will be used; otherwise, `whisper-small.en` will be used. `whspr` is currently only
-available on Linux.
+available on Linux and can be installed from [PyPI](https://pypi.org/project/whspr/).
 
 ## Usage
 
@@ -24,26 +24,27 @@ result to the clipboard. The difference is that `Super+V` will additionally past
 into the currently focussed application. `Super+X` will cancel any dictation currently in progress.
 Sounds will indicate when `whspr` is listening and when it has finished processing.
 
+`whspr` can also be accessed from within Python:
+
+```python
+from whspr import transcribe
+result = transcribe("path/to/audio.mp3")
+```
+
 ## Installation
 
 `whspr` depends on:
 
 - the `aplay`, `arecord`, `ydotool` commands. The former two are part of the
-  `alsa-utils` package and installed on most systems already. `ydotool` is optional
+  `alsa-utils` package and installed on most distros by default. `ydotool` is optional
   and only required for the `--paste` flag (see [Usage](#usage)).
 - a clipboard backend compatible with `pyperclip`, e.g. `wl-clipboard` on Wayland or `xclip` on X11.
 - for optional GPU-accelerated speech recognition, an Nvidia GPU and drivers are required.
 
-On Ubuntu, run:
+On Ubuntu, simply run:
 
 ```bash
-sudo apt update && sudo apt install -y alsa-utils wl-clipboard xclip ydotool
-pip install whspr[gpu]  # gpu support is optional; omit [gpu] if it's not desired
-```
-
-`whspr` can also be used from within Python:
-
-```python
-from whspr import transcribe
-result = transcribe("path/to/audio.mp3")
+sudo apt update && sudo apt install -y alsa-utils wl-clipboard xclip ydotool pipx
+pipx install whspr[gpu]  # gpu support is optional; omit [gpu] if it's not desired
+whspr --finish-setup     # optional to pre-load the model from the internet before its first use
 ```

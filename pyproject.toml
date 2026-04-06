@@ -16,6 +16,8 @@ license-files = ["LICEN[CS]E*"]
 dependencies = ["faster-whisper>=1.1,<2", "pyperclip"]
 classifiers = ["Operating System :: POSIX :: Linux"]
 
+[project.urls]
+Homepage = "https://github.com/KenanHanke/whspr"
 
 [project.optional-dependencies]
 gpu = ["nvidia-cublas-cu12>=12.6,<13", "nvidia-cudnn-cu12>=9.6,<10"]
