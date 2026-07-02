@@ -181,7 +181,7 @@ def _ensure_recording_exists(recording_path: str) -> None:
 def _paste_with_ydotool() -> None:
     try:
         subprocess.Popen(
-            ["ydotool", "key", "ctrl+v"],
+            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
