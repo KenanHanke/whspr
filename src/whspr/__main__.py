@@ -14,13 +14,13 @@ def main():
     if args.finish_setup:
         server.load_model()  # load the model to finish setup and then exit
         return
-    
-    # try to start the server; this will fail silently if it's already up
-    server.start()
 
     if args.cancel:
+        # Cancelling discards the recording, so it has no use for a server.
         client.cancel_recording()
     else:
+        # try to start the server; this will fail silently if it's already up
+        server.start()
         client.main(paste=args.paste)
 
 

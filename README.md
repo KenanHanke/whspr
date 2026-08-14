@@ -6,8 +6,12 @@ windowing or application focus.
 
 Processing is done locally using `faster-whisper`. If `whspr[gpu]` optional dependencies
 are installed and an Nvidia GPU is available, the model `whisper-large-v3-turbo`
-will be used; otherwise, `whisper-small.en` will be used. `whspr` is currently only
+will be used; otherwise, `whisper-small` will be used. `whspr` is currently only
 available on Linux and can be installed from [PyPI](https://pypi.org/project/whspr/).
+
+Transcription happens in a background server process that keeps the model warm
+between dictations and shuts itself down automatically after five minutes of
+inactivity; it is started (and restarted) on demand, so this is invisible in use.
 
 ## Usage
 
@@ -45,6 +49,6 @@ On Ubuntu, simply run:
 
 ```bash
 sudo apt update && sudo apt install -y alsa-utils wl-clipboard xclip ydotool pipx
-pipx install whspr[gpu]  # gpu support is optional; omit [gpu] if it's not desired
+pipx install 'whspr[gpu]'  # gpu support is optional; omit [gpu] if it's not desired
 whspr --finish-setup     # optional to pre-load the model from the internet before its first use
 ```

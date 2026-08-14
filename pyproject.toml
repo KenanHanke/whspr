@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "whspr"
-version = "1.0.0"
+version = "1.1.0"
 authors = [{ name = "Kenan Hanke" }]
 description = "An interactive dictation tool for local speech recognition using OpenAI's Whisper models."
 readme = "README.md"
@@ -21,6 +21,7 @@ Homepage = "https://github.com/KenanHanke/whspr"
 
 [project.optional-dependencies]
 gpu = ["nvidia-cublas-cu12>=12.6,<13", "nvidia-cudnn-cu12>=9.6,<10"]
+dev = ["pytest", "pytest-timeout"]
 
 [project.scripts]
 whspr = "whspr.__main__:main"

@@ -1,15 +1,16 @@
+# src/whspr/_cuda_bootstrap.py
+"""Make pip-installed NVIDIA libraries loadable before ctranslate2 needs them."""
+
 from __future__ import annotations
 
 import ctypes
 import importlib.util
 import os
 from pathlib import Path
-import sys
 from typing import Iterable
 
 _BOOTSTRAPPED = False
-_DLL_DIR_HANDLES = []   # Windows: keep add_dll_directory handles alive
-_PRELOADED_HANDLES = [] # Linux: keep CDLL handles alive
+_PRELOADED_HANDLES = []  # keep CDLL handles alive
 
 
 def _package_dir(module_name: str) -> Path | None:
@@ -47,8 +48,8 @@ def _existing_dirs(paths: Iterable[Path]) -> list[Path]:
 
 def _candidate_lib_dirs() -> list[Path]:
     """
-    Look for NVIDIA pip package lib/bin directories. We keep this tolerant:
-    some packages may be absent, depending on platform and environment.
+    Look for NVIDIA pip package lib directories. We keep this tolerant:
+    some packages may be absent, depending on the environment.
     """
     candidates: list[Path] = []
 
@@ -62,9 +63,7 @@ def _candidate_lib_dirs() -> list[Path]:
         if not pkg_dir:
             continue
 
-        # Linux wheels usually store .so files in lib/
-        # Windows wheels commonly use bin/
-        candidates.extend(_existing_dirs([pkg_dir / "lib", pkg_dir / "bin"]))
+        candidates.extend(_existing_dirs([pkg_dir / "lib"]))
 
     # Deduplicate while preserving order
     seen: set[Path] = set()
@@ -107,12 +106,22 @@ def _glob_unique(lib_dirs: list[Path], patterns: list[str]) -> list[Path]:
     return found
 
 
-def _bootstrap_linux(lib_dirs: list[Path]) -> None:
+def ensure_cuda_runtime_loaded() -> None:
+    """
+    Make NVIDIA pip-installed shared libraries discoverable before importing
+    faster_whisper / ctranslate2.
+    """
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return
+
+    lib_dirs = _candidate_lib_dirs()
+
     # Helpful for child processes and diagnostics, but don't rely on it alone.
     _prepend_env_path("LD_LIBRARY_PATH", lib_dirs)
 
-    # Preload likely CUDA dependencies by absolute path before importing ctranslate2.
-    # Order matters a bit; load lower-level/common pieces first.
+    # Preload likely CUDA dependencies by absolute path before importing
+    # ctranslate2.  Order matters a bit; load lower-level pieces first.
     load_order = [
         "libcudart.so*",
         "libnvrtc.so*",
@@ -132,43 +141,38 @@ def _bootstrap_linux(lib_dirs: list[Path]) -> None:
             # Keep going; the final import will produce the actionable failure.
             pass
 
-
-def _bootstrap_windows(lib_dirs: list[Path]) -> None:
-    if not hasattr(os, "add_dll_directory"):
-        return
-
-    for lib_dir in lib_dirs:
-        try:
-            h = os.add_dll_directory(str(lib_dir)) # type: ignore
-            _DLL_DIR_HANDLES.append(h)
-        except OSError:
-            pass
-
-
-def ensure_cuda_runtime_loaded() -> None:
-    """
-    Make NVIDIA pip-installed shared libraries discoverable before importing
-    faster_whisper / ctranslate2.
-    """
-    global _BOOTSTRAPPED
-    if _BOOTSTRAPPED:
-        return
-
-    lib_dirs = _candidate_lib_dirs()
-
-    if os.name == "nt":
-        _bootstrap_windows(lib_dirs)
-    elif sys.platform.startswith("linux"):
-        _bootstrap_linux(lib_dirs)
-
     _BOOTSTRAPPED = True
 
 
-def diagnostic_report() -> str:
+def cuda_support_libraries_present() -> bool:
+    """Whether the cuBLAS and cuDNN versions ctranslate2 needs can be loaded.
+
+    ctranslate2 loads these lazily (cuBLAS at model load, cuDNN at first
+    inference), so a working NVIDIA driver alone is not proof that GPU
+    inference can succeed.  Checks the pip-installed NVIDIA wheels first,
+    then dlopen-probes for system installs — in both cases pinned to the
+    versions every ctranslate2 4.x wheel links against (CUDA 12 cuBLAS;
+    cuDNN 9 for >=4.5, cuDNN 8 for older), because a version-blind search
+    would accept e.g. a CUDA 11 toolkit that ctranslate2 is guaranteed to
+    reject.
+    """
     lib_dirs = _candidate_lib_dirs()
-    lines = [
-        f"platform={sys.platform}",
-        f"lib_dirs={','.join(str(d) for d in lib_dirs) if lib_dirs else '<none>'}",
-        f"LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH', '')}",
+    checks = [
+        (["libcublas.so.12*"], ["libcublas.so.12"]),
+        (["libcudnn.so.9*", "libcudnn.so.8*"], ["libcudnn.so.9", "libcudnn.so.8"]),
     ]
-    return "\n".join(lines)
+    for wheel_patterns, sonames in checks:
+        if _glob_unique(lib_dirs, wheel_patterns):
+            continue
+        if any(_loadable(soname) for soname in sonames):
+            continue
+        return False
+    return True
+
+
+def _loadable(soname: str) -> bool:
+    try:
+        ctypes.CDLL(soname)
+        return True
+    except OSError:
+        return False
