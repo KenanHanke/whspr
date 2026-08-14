@@ -23,6 +23,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -233,20 +234,50 @@ def _ensure_recording_exists(recording_path: str) -> None:
         raise RuntimeError(f"Recording file looks empty: {recording_path}")
 
 
+def _play_sound_best_effort(path: str, warn: bool = True) -> None:
+    """Play a sound without ever letting its failure change the outcome.
+
+    Used for the notification sounds that play once a dictation has already
+    finished (succeeded or failed): a broken/busy audio device breaks every
+    aplay call identically, and that must never turn a completed dictation
+    into an error.  `warn=False` stays silent, for the error path where the
+    real exception is about to be raised anyway.
+    """
+    try:
+        play_wav_blocking(path)
+    except (RuntimeError, OSError) as exc:
+        if warn:
+            print(
+                f"whspr: could not play {os.path.basename(path)}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def _paste_with_ydotool() -> None:
     try:
         process = subprocess.Popen(
             ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # Let ydotool's own error through to stderr — the common failure is
+            # "failed to connect socket .ydotool_socket" (ydotoold not running),
+            # which is invisible if discarded, even when debugging from a shell.
             start_new_session=True,
             close_fds=True,
         )
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError) as exc:
+        print(f"whspr: could not run ydotool for --paste: {exc}", file=sys.stderr)
         return
+
+    def reap():
+        if process.wait() != 0:
+            print(
+                "whspr: --paste via ydotool failed (is the ydotoold daemon running?)",
+                file=sys.stderr,
+            )
+
     # Reap in the background so no zombie lingers inside long-lived callers.
-    threading.Thread(target=process.wait, daemon=True).start()
+    threading.Thread(target=reap, daemon=True).start()
 
 
 def _accept_stop_connection(server_sock, recorder):
@@ -267,10 +298,7 @@ def _accept_stop_connection(server_sock, recorder):
         except socket.timeout:
             if not recorder_died and recorder.poll() is not None:
                 recorder_died = True
-                try:
-                    play_wav_blocking(CANCELLED_SOUND)
-                except RuntimeError:
-                    pass
+                _play_sound_best_effort(CANCELLED_SOUND)
 
 
 def record_until_stop() -> str:
@@ -285,8 +313,11 @@ def record_until_stop() -> str:
 
     If the recording failed, reply with `ERROR <reason>` instead.
     Returns the recording path once the file is ready.
+
+    The start sound is best-effort: a busy or broken audio *output* device
+    must not stop the (input-side) recording from happening.
     """
-    play_wav_blocking(START_SOUND)
+    _play_sound_best_effort(START_SOUND)
 
     _sweep_stale_recordings()
     recording_path = _new_recording_path()
@@ -423,7 +454,7 @@ def cancel_recording():
         return  # the recording ended on its own before we could cancel it
 
     _unlink_if_exists(recording_path)
-    play_wav_blocking(CANCELLED_SOUND)
+    _play_sound_best_effort(CANCELLED_SOUND)
 
 
 def stop_transcribe_copy_and_notify(paste=False):
@@ -437,20 +468,73 @@ def stop_transcribe_copy_and_notify(paste=False):
 
     The recording file is deleted only after the transcript has safely landed
     in the clipboard, so a failure never discards the user's dictation.
+
+    Because the interface is sound-based, any failure plays `CANCELLED_SOUND`
+    so the user is never left with silence after the stop beep; the underlying
+    error is still re-raised so it shows up when run from a terminal.
     """
-    recording_path = request_stop_and_wait()
-
-    stop_proc = play_wav_background(STOP_SOUND)
+    recording_path = None
     try:
-        transcript = str(server.transcribe(recording_path))
-        pyperclip.copy(transcript)
-        _unlink_if_exists(recording_path)
-    finally:
-        _wait_for_playback("aplay", stop_proc)
+        recording_path = request_stop_and_wait()
 
+        stop_proc = _start_notification_sound(STOP_SOUND)
+        try:
+            transcript = str(server.transcribe(recording_path))
+            pyperclip.copy(transcript)
+        finally:
+            # Once the transcript is safely in the clipboard, a failure of the
+            # notification sound must not fail the dictation; only warn.
+            _finish_notification_sound(stop_proc)
+    except Exception as exc:
+        # Silent here: the real error is re-raised right after, so a failed
+        # cancelled sound must not add a second, misleading message.
+        _play_sound_best_effort(CANCELLED_SOUND, warn=False)
+        if recording_path and os.path.exists(recording_path):
+            print(
+                f"whspr: dictation failed ({exc}); "
+                f"the recording is preserved at {recording_path}",
+                file=sys.stderr,
+            )
+        raise
+
+    # The dictation has fully succeeded (transcript on the clipboard); a broken
+    # audio device must not now turn that success into a failure.
+    _unlink_if_exists(recording_path)
     if paste:
         _paste_with_ydotool()
-    play_wav_blocking(FINISHED_SOUND)
+    _play_sound_best_effort(FINISHED_SOUND)
+
+
+def _start_notification_sound(path):
+    """Launch a background notification sound, or return None if it cannot even
+    start (e.g. aplay missing, or a transient fork/fd exhaustion).
+
+    This runs before transcription, so a failure to *launch* the sound must
+    not prevent the dictation any more than a failure to *play* it does.
+    """
+    try:
+        return play_wav_background(path)
+    except OSError as exc:
+        print(
+            f"whspr: could not play {os.path.basename(path)}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _finish_notification_sound(stop_proc):
+    """Wait for the background stop sound; warn (never raise) if it failed.
+
+    The transcript is already in the clipboard by the time this runs, so a
+    broken notification sound must not present a successful dictation as a
+    failure.
+    """
+    if stop_proc is None:
+        return
+    try:
+        _wait_for_playback("aplay", stop_proc)
+    except RuntimeError as exc:
+        print(f"whspr: could not play the stop sound: {exc}", file=sys.stderr)
 
 
 def main(paste=False):

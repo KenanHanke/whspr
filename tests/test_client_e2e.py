@@ -306,6 +306,59 @@ def test_dead_microphone_reports_error_instead_of_silence(dictation_env, tmp_pat
             recorder.wait()
 
 
+FAILING_APLAY_SHIM = """#!/bin/bash
+# Simulates a busy/broken audio OUTPUT device: every playback fails, while
+# the microphone (arecord) is unaffected.
+echo "aplay: audio open error: Device or resource busy" >&2
+exit 1
+"""
+
+
+def test_broken_audio_output_still_dictates(dictation_env, tmp_path):
+    """A busy/broken speaker must not make the tool unusable: the whole
+    dictation (record -> transcribe -> clipboard) must still succeed with no
+    beeps, rather than crash-looping on the start sound."""
+    shim_dir = tmp_path / "silent-bin"
+    shim_dir.mkdir()
+    (shim_dir / "arecord").write_text(ARECORD_SHIM)
+    (shim_dir / "aplay").write_text(FAILING_APLAY_SHIM)
+    os.chmod(shim_dir / "arecord", 0o755)
+    os.chmod(shim_dir / "aplay", 0o755)
+    env = dict(dictation_env)
+    env["PATH"] = f"{shim_dir}:{env['PATH']}"
+
+    set_clipboard(env, "sentinel-broken-audio")
+
+    log = open(tmp_path / "recorder.log", "w")
+    recorder = subprocess.Popen(
+        [sys.executable, "-m", "whspr"], env=env, stdout=log, stderr=subprocess.STDOUT
+    )
+    log.close()
+    try:
+        # The recorder must come up despite the start sound failing.
+        wait_until(
+            lambda: os.path.exists(recorder_socket_path(env)),
+            timeout=30.0,
+            message="recorder to start listening without a working speaker",
+        )
+
+        returncode, out = run_whspr(env, [], tmp_path, "broken-audio-stopper", 600)
+        assert returncode == 0, out  # success despite every aplay failing
+
+        recorder.wait(timeout=30)
+        assert recorder.returncode == 0, recorder_log(tmp_path)
+
+        transcript = read_clipboard(env)
+        assert keywords_found(transcript, ["quick", "brown", "fox", "lazy", "dog"], 3), (
+            f"clipboard: {transcript!r}"
+        )
+        assert leftover_recordings(env) == []
+    finally:
+        if recorder.poll() is None:
+            recorder.kill()
+            recorder.wait()
+
+
 def test_finish_setup_preloads_model(dictation_env, tmp_path):
     returncode, log = run_whspr(
         dictation_env, ["--finish-setup"], tmp_path, "finish-setup", 600

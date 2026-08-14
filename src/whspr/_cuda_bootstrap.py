@@ -18,7 +18,13 @@ def _package_dir(module_name: str) -> Path | None:
     Return the installed package directory for a module/package, using importlib
     instead of relying on module.__file__.
     """
-    spec = importlib.util.find_spec(module_name)
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (ImportError, AttributeError, ValueError):
+        # find_spec RAISES (not returns None) for a dotted name whose parent
+        # package is absent — the normal case on installs without the [gpu]
+        # extras, where no "nvidia" package exists at all.
+        return None
     if spec is None:
         return None
 
@@ -110,36 +116,43 @@ def ensure_cuda_runtime_loaded() -> None:
     """
     Make NVIDIA pip-installed shared libraries discoverable before importing
     faster_whisper / ctranslate2.
+
+    Strictly best-effort and guaranteed never to raise: on machines without
+    the [gpu] extras there is simply nothing to preload, and no bootstrap
+    problem may ever break the (CUDA-free) CPU transcription path.
     """
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return
 
-    lib_dirs = _candidate_lib_dirs()
+    try:
+        lib_dirs = _candidate_lib_dirs()
 
-    # Helpful for child processes and diagnostics, but don't rely on it alone.
-    _prepend_env_path("LD_LIBRARY_PATH", lib_dirs)
+        # Helpful for child processes and diagnostics, but don't rely on it alone.
+        _prepend_env_path("LD_LIBRARY_PATH", lib_dirs)
 
-    # Preload likely CUDA dependencies by absolute path before importing
-    # ctranslate2.  Order matters a bit; load lower-level pieces first.
-    load_order = [
-        "libcudart.so*",
-        "libnvrtc.so*",
-        "libcublasLt.so*",
-        "libcublas.so*",
-        "libcudnn*.so*",
-    ]
+        # Preload likely CUDA dependencies by absolute path before importing
+        # ctranslate2.  Order matters a bit; load lower-level pieces first.
+        load_order = [
+            "libcudart.so*",
+            "libnvrtc.so*",
+            "libcublasLt.so*",
+            "libcublas.so*",
+            "libcudnn*.so*",
+        ]
 
-    libs = _glob_unique(lib_dirs, load_order)
-    mode = getattr(os, "RTLD_NOW", 0) | getattr(os, "RTLD_GLOBAL", 0)
+        libs = _glob_unique(lib_dirs, load_order)
+        mode = getattr(os, "RTLD_NOW", 0) | getattr(os, "RTLD_GLOBAL", 0)
 
-    for lib in libs:
-        try:
-            handle = ctypes.CDLL(str(lib), mode=mode)
-            _PRELOADED_HANDLES.append(handle)
-        except OSError:
-            # Keep going; the final import will produce the actionable failure.
-            pass
+        for lib in libs:
+            try:
+                handle = ctypes.CDLL(str(lib), mode=mode)
+                _PRELOADED_HANDLES.append(handle)
+            except OSError:
+                # Keep going; the final import will produce the actionable failure.
+                pass
+    except Exception:
+        pass  # never let CUDA discovery take down CPU-only transcription
 
     _BOOTSTRAPPED = True
 

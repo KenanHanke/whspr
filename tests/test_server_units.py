@@ -204,6 +204,73 @@ def test_load_model_falls_back_to_cpu_when_warm_up_fails(
 
 
 import importlib.util
+import subprocess
+import sys
+
+
+# Faithfully simulates an install without the [gpu] extras: find_spec for any
+# "nvidia.*" name raises ModuleNotFoundError exactly like a missing parent
+# package does.  Must run in a subprocess — in this process the real nvidia
+# wheels may already be imported and cached in sys.modules.
+NO_NVIDIA_PROGRAM = """
+import sys, types
+
+class BlockNvidia:
+    def find_spec(self, name, path=None, target=None):
+        if name == "nvidia" or name.startswith("nvidia."):
+            raise ModuleNotFoundError("No module named 'nvidia'")
+        return None
+
+sys.meta_path.insert(0, BlockNvidia())
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+import whspr.server as server
+
+server._load_whisper_model = lambda name, **kwargs: types.SimpleNamespace(
+    name=name, kwargs=kwargs
+)
+model = server.load_model()
+print("selected:" + model.name + ":" + model.kwargs["device"])
+"""
+
+
+def test_load_model_survives_missing_nvidia_package():
+    """Installs without the [gpu] extras have no `nvidia` package at all;
+    model loading must still reach the CPU model (regression: the laptop
+    crash `model load failed: No module named 'nvidia'`)."""
+    result = subprocess.run(
+        [sys.executable, "-c", NO_NVIDIA_PROGRAM],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "selected:small:cpu" in result.stdout
+
+
+def test_package_dir_returns_none_when_parent_package_missing(monkeypatch):
+    import whspr._cuda_bootstrap as bootstrap
+
+    def raising_find_spec(name):
+        raise ModuleNotFoundError("No module named 'nvidia'")
+
+    monkeypatch.setattr(importlib.util, "find_spec", raising_find_spec)
+    assert bootstrap._package_dir("nvidia.cuda_runtime") is None
+    assert bootstrap._candidate_lib_dirs() == []
+
+
+def test_ensure_cuda_runtime_loaded_never_raises(monkeypatch):
+    import whspr._cuda_bootstrap as bootstrap
+
+    def exploding(*args, **kwargs):
+        raise RuntimeError("hostile environment")
+
+    monkeypatch.setattr(bootstrap, "_candidate_lib_dirs", exploding)
+    monkeypatch.setattr(bootstrap, "_BOOTSTRAPPED", False)
+    bootstrap.ensure_cuda_runtime_loaded()  # must not raise
+    assert bootstrap._BOOTSTRAPPED is True
 
 
 @pytest.mark.skipif(
