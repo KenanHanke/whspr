@@ -285,3 +285,95 @@ def test_paste_nonzero_exit_warns_about_ydotoold(monkeypatch, capsys):
             return
         time.sleep(0.02)
     pytest.fail("expected a ydotoold warning on nonzero ydotool exit")
+
+
+# --- recorder process hardening ------------------------------------------------
+
+PID_REPORTING_ARECORD = """#!/bin/bash
+# Fake arecord: report our pid, "record" a little, then run until signalled.
+for last in "$@"; do :; done
+echo $$ > "$ARECORD_PID_FILE"
+head -c 1000 /dev/zero > "$last"
+trap 'exit 0' INT TERM
+while true; do sleep 0.05; done
+"""
+
+SILENT_APLAY = "#!/bin/bash\nexit 0\n"
+
+
+def start_shimmed_recorder(tmp_path, runtime_dir):
+    import subprocess
+    import sys
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, script in (("arecord", PID_REPORTING_ARECORD), ("aplay", SILENT_APLAY)):
+        (bin_dir / name).write_text(script)
+        (bin_dir / name).chmod(0o755)
+    pid_file = tmp_path / "arecord.pid"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "XDG_RUNTIME_DIR": str(runtime_dir),
+        "ARECORD_PID_FILE": str(pid_file),
+    }
+    # client.main() directly: the recorder side, without spawning a server.
+    recorder = subprocess.Popen(
+        [sys.executable, "-c", "import whspr.client as c; c.main()"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 20.0
+    while not (pid_file.exists() and pid_file.read_text().strip()):
+        assert time.monotonic() < deadline, "fake arecord never started"
+        time.sleep(0.05)
+    return recorder, int(pid_file.read_text())
+
+
+def process_is_gone(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().split(") ")[1].startswith("Z")  # zombie: dead
+    except FileNotFoundError:
+        return True
+
+
+def test_recording_and_recorder_socket_are_private(tmp_path, client_runtime):
+    recorder, arecord_pid = start_shimmed_recorder(tmp_path, client_runtime)
+    try:
+        socket_path = client_runtime / "whspr-recorder.sock"
+        recording = client_runtime / f"whspr-recording-{recorder.pid}.wav"
+        deadline = time.monotonic() + 10.0
+        while not socket_path.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert os.stat(socket_path).st_mode & 0o777 == 0o600
+        assert os.stat(recording).st_mode & 0o777 == 0o600
+    finally:
+        recorder.kill()
+        recorder.wait()
+        if not process_is_gone(arecord_pid):
+            os.kill(arecord_pid, 9)
+
+
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGKILL"])
+def test_killed_recorder_does_not_orphan_arecord(tmp_path, client_runtime, signal_name):
+    """arecord must not keep the microphone open after its recorder dies."""
+    import signal
+
+    recorder, arecord_pid = start_shimmed_recorder(tmp_path, client_runtime)
+    try:
+        recorder.send_signal(getattr(signal, signal_name))
+        recorder.wait(timeout=10)
+        deadline = time.monotonic() + 10.0
+        while not process_is_gone(arecord_pid):
+            assert time.monotonic() < deadline, "arecord outlived its recorder"
+            time.sleep(0.05)
+    finally:
+        if recorder.poll() is None:
+            recorder.kill()
+            recorder.wait()
+        if not process_is_gone(arecord_pid):
+            os.kill(arecord_pid, 9)

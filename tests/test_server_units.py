@@ -145,15 +145,78 @@ def no_cuda_bootstrap(monkeypatch):
     monkeypatch.setattr(bootstrap, "ensure_cuda_runtime_loaded", lambda: None)
 
 
-def test_load_model_uses_multilingual_small_on_cpu(monkeypatch, no_cuda_bootstrap):
+CPU_MODEL = types.SimpleNamespace(name="parakeet")
+
+
+@pytest.fixture
+def fake_cpu_model(monkeypatch):
+    monkeypatch.setattr(server, "_load_cpu_model", lambda: CPU_MODEL)
+
+
+def test_load_model_uses_parakeet_on_cpu(monkeypatch, no_cuda_bootstrap, fake_cpu_model):
     loader = RecordingLoader()
     monkeypatch.setattr(server, "_cuda_is_usable", lambda: False)
     monkeypatch.setattr(server, "_load_whisper_model", loader)
 
     model = server.load_model()
 
-    assert loader.calls == [("small", {"device": "cpu", "compute_type": "int8"})]
-    assert model.name == "small"  # multilingual "small", NOT "small.en"
+    assert loader.calls == []  # no Whisper model is even downloaded on the CPU
+    assert model is CPU_MODEL
+
+
+def test_cpu_model_is_int8_parakeet_tdt_v3_on_the_cpu_provider(monkeypatch):
+    import onnx_asr
+
+    from whspr._parakeet import ParakeetModel
+
+    calls = []
+
+    def fake_load_model(name, **kwargs):
+        calls.append((name, kwargs))
+        return "fake-asr"
+
+    monkeypatch.setattr(onnx_asr, "load_model", fake_load_model)
+    model = server._load_cpu_model()
+
+    assert isinstance(model, ParakeetModel)
+    [(name, kwargs)] = calls
+    assert name == "nemo-parakeet-tdt-0.6b-v3"
+    assert kwargs["quantization"] == "int8"
+    assert kwargs["providers"] == ["CPUExecutionProvider"]
+    assert kwargs["resampler_config"]["providers"] == ["CPUExecutionProvider"]
+
+    options = kwargs["sess_options"]
+    assert 1 <= options.intra_op_num_threads <= 8  # not one per core
+    assert options.get_session_config_entry("session.intra_op.allow_spinning") == "0"
+    assert options.enable_cpu_mem_arena is False
+    assert kwargs["resampler_config"]["sess_options"].intra_op_num_threads == 1
+
+
+def test_library_api_loads_the_model_once_under_concurrent_first_calls(monkeypatch):
+    import whspr
+
+    loads = []
+
+    def slow_load():
+        loads.append(1)
+        import time
+
+        time.sleep(0.3)
+        return FakeSegmentModel(["hi"])
+
+    monkeypatch.setattr(whspr, "_MODEL", None)
+    monkeypatch.setattr(server, "load_model", slow_load)
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(whspr.transcribe("x")))
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert loads == [1]
+    assert results == ["hi"] * 8
 
 
 def test_load_model_uses_turbo_on_gpu(monkeypatch, no_cuda_bootstrap):
@@ -173,7 +236,7 @@ def test_load_model_uses_turbo_on_gpu(monkeypatch, no_cuda_bootstrap):
 
 
 def test_load_model_falls_back_to_cpu_when_cuda_model_fails(
-    monkeypatch, no_cuda_bootstrap
+    monkeypatch, no_cuda_bootstrap, fake_cpu_model, capsys
 ):
     loader = RecordingLoader(fail_on={"large-v3-turbo"})
     monkeypatch.setattr(server, "_cuda_is_usable", lambda: True)
@@ -181,12 +244,13 @@ def test_load_model_falls_back_to_cpu_when_cuda_model_fails(
 
     model = server.load_model()
 
-    assert [call[0] for call in loader.calls] == ["large-v3-turbo", "small"]
-    assert model.name == "small"
+    assert [call[0] for call in loader.calls] == ["large-v3-turbo"]
+    assert model is CPU_MODEL
+    assert "using the CPU model" in capsys.readouterr().err  # never silent
 
 
 def test_load_model_falls_back_to_cpu_when_warm_up_fails(
-    monkeypatch, no_cuda_bootstrap
+    monkeypatch, no_cuda_bootstrap, fake_cpu_model
 ):
     loader = RecordingLoader()
     monkeypatch.setattr(server, "_cuda_is_usable", lambda: True)
@@ -199,8 +263,20 @@ def test_load_model_falls_back_to_cpu_when_warm_up_fails(
 
     model = server.load_model()
 
-    assert [call[0] for call in loader.calls] == ["large-v3-turbo", "small"]
-    assert model.name == "small"
+    assert [call[0] for call in loader.calls] == ["large-v3-turbo"]
+    assert model is CPU_MODEL
+
+
+def test_cpu_model_load_failure_propagates(monkeypatch, no_cuda_bootstrap):
+    """The server reports a failed load to clients; it must not be swallowed."""
+    monkeypatch.setattr(server, "_cuda_is_usable", lambda: False)
+
+    def broken():
+        raise OSError("no network")
+
+    monkeypatch.setattr(server, "_load_cpu_model", broken)
+    with pytest.raises(OSError, match="no network"):
+        server.load_model()
 
 
 import importlib.util
@@ -212,7 +288,7 @@ import sys
 # "nvidia.*" name raises ModuleNotFoundError exactly like a missing parent
 # package does.  Must run in a subprocess — in this process the real nvidia
 # wheels may already be imported and cached in sys.modules.
-NO_NVIDIA_PROGRAM = """
+BLOCK_NVIDIA_PREAMBLE = """
 import sys, types
 
 class BlockNvidia:
@@ -225,14 +301,17 @@ sys.meta_path.insert(0, BlockNvidia())
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+"""
 
+NO_NVIDIA_PROGRAM = BLOCK_NVIDIA_PREAMBLE + """
 import whspr.server as server
 
 server._load_whisper_model = lambda name, **kwargs: types.SimpleNamespace(
     name=name, kwargs=kwargs
 )
+server._load_cpu_model = lambda: types.SimpleNamespace(name="parakeet")
 model = server.load_model()
-print("selected:" + model.name + ":" + model.kwargs["device"])
+print("selected:" + model.name)
 """
 
 
@@ -247,7 +326,7 @@ def test_load_model_survives_missing_nvidia_package():
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
-    assert "selected:small:cpu" in result.stdout
+    assert "selected:parakeet" in result.stdout
 
 
 def test_package_dir_returns_none_when_parent_package_missing(monkeypatch):
@@ -350,6 +429,16 @@ def test_transcribe_helper_removes_known_hallucinations():
     assert server.transcribe_helper("ignored", model) == "Real text."
 
 
+def test_transcribe_helper_keeps_parakeet_output_verbatim(monkeypatch):
+    """The Whisper hallucination filter must not delete genuine speech that
+    Parakeet (which does not hallucinate these phrases) transcribed."""
+    from whspr._parakeet import ParakeetModel
+
+    model = ParakeetModel(asr=None)
+    monkeypatch.setattr(model, "transcribe", lambda path: "Real text. Thank you.")
+    assert server.transcribe_helper("ignored", model) == "Real text. Thank you."
+
+
 # --- server state ------------------------------------------------------------
 
 
@@ -383,3 +472,33 @@ def test_wait_for_model_reports_load_failure():
     state.set_model_error(RuntimeError("no weights"))
     with pytest.raises(RuntimeError, match="model load failed"):
         state.wait_for_model()
+
+
+# --- legacy server shutdown ----------------------------------------------------
+
+
+def test_legacy_shutdown_leaves_other_users_sockets_alone(tmp_path, monkeypatch):
+    """The legacy path is machine-wide in /tmp; a socket there owned by another
+    user must be neither contacted (a squatter could stall every start) nor
+    unlinked."""
+    legacy_path = str(tmp_path / "legacy.sock")
+    monkeypatch.setattr(server, "_LEGACY_SOCKET_PATH", legacy_path)
+    monkeypatch.setattr(server, "_LEGACY_LOCK_PATH", str(tmp_path / "legacy.lock"))
+    squatter = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    squatter.bind(legacy_path)
+    squatter.listen(1)
+    squatter.setblocking(False)
+    try:
+        real_uid = os.getuid()
+        monkeypatch.setattr(server.os, "getuid", lambda: real_uid + 1)
+        assert server._stop_legacy_server() is False
+        with pytest.raises(BlockingIOError):
+            squatter.accept()  # nobody ever connected
+        assert os.path.exists(legacy_path)
+    finally:
+        squatter.close()
+
+
+def test_legacy_shutdown_without_legacy_socket_is_a_noop(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_LEGACY_SOCKET_PATH", str(tmp_path / "absent.sock"))
+    assert server._stop_legacy_server() is False

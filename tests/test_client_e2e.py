@@ -2,7 +2,8 @@
 
 `arecord`/`aplay` are replaced by shims on PATH (no sound hardware needed) and
 the clipboard runs against a headless Xvfb display via xclip, so this covers
-__main__, client.py, server.py, and a real Whisper model end to end.
+__main__, client.py, server.py, and a real model (Parakeet, on the CPU) end
+to end.
 """
 
 import os
@@ -364,3 +365,62 @@ def test_finish_setup_preloads_model(dictation_env, tmp_path):
         dictation_env, ["--finish-setup"], tmp_path, "finish-setup", 600
     )
     assert returncode == 0, log
+
+
+def test_stop_server_after_dictation_then_dictate_again(dictation_env, tmp_path):
+    """--stop-server frees the real server right away, and the next
+    dictation transparently brings a new one up."""
+    for round_number in (1, 2):
+        set_clipboard(dictation_env, f"sentinel-round-{round_number}")
+        recorder = start_recorder(dictation_env, tmp_path)
+        try:
+            returncode, log = run_whspr(dictation_env, [], tmp_path, "stopper", 600)
+            assert returncode == 0, log
+            recorder.wait(timeout=30)
+            assert recorder.returncode == 0, recorder_log(tmp_path)
+        finally:
+            if recorder.poll() is None:
+                recorder.kill()
+                recorder.wait()
+        transcript = read_clipboard(dictation_env)
+        assert keywords_found(transcript, ["quick", "brown", "fox", "lazy", "dog"], 3), (
+            f"round {round_number} clipboard: {transcript!r}"
+        )
+
+        assert server.is_running()
+        returncode, log = run_whspr(
+            dictation_env, ["--stop-server"], tmp_path, "stop-server", 60
+        )
+        assert returncode == 0, log
+        assert "Stopped the whspr server." in log
+        assert not server.is_running()
+
+
+def test_stop_server_mid_recording_does_not_lose_the_dictation(dictation_env, tmp_path):
+    """Stopping the server while the user is still speaking must not break
+    the dictation: finishing it starts a fresh server."""
+    set_clipboard(dictation_env, "sentinel-mid-recording")
+    recorder = start_recorder(dictation_env, tmp_path)
+    try:
+        # The recorder's `whspr` spawned a server; it may still be starting.
+        wait_until(server.is_running, timeout=30.0, message="server to start")
+        returncode, log = run_whspr(
+            dictation_env, ["--stop-server"], tmp_path, "stop-server", 60
+        )
+        assert returncode == 0, log
+        assert "Stopped the whspr server." in log
+        assert not server.is_running()
+
+        returncode, log = run_whspr(dictation_env, [], tmp_path, "stopper", 600)
+        assert returncode == 0, log
+        recorder.wait(timeout=30)
+        assert recorder.returncode == 0, recorder_log(tmp_path)
+
+        transcript = read_clipboard(dictation_env)
+        assert keywords_found(transcript, ["quick", "brown", "fox", "lazy", "dog"], 3), (
+            f"clipboard: {transcript!r}"
+        )
+    finally:
+        if recorder.poll() is None:
+            recorder.kill()
+            recorder.wait()

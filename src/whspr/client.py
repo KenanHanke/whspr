@@ -169,8 +169,39 @@ def _start_arecord(recording_path: str):
         ],
         stdout=subprocess.DEVNULL,
         stderr=stderr_log,
+        # The recording is created private (0600) even in the world-readable
+        # /tmp fallback of runtime_file().
+        umask=0o077,
+        preexec_fn=_stop_with_parent_hook(),
     )
     return process, stderr_log
+
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _stop_with_parent_hook():
+    """A preexec_fn making the child receive SIGTERM once this process dies.
+
+    Without it, a recorder killed by a signal (logout, `kill`, the OOM
+    killer) orphans arecord, which then keeps the microphone open and the
+    recording growing until the session ends.  Returns None where prctl is
+    unavailable.
+    """
+    try:
+        import ctypes  # only the recorder needs it; keeps other keypresses fast
+
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (ImportError, OSError, AttributeError):
+        return None
+    parent_pid = os.getpid()
+
+    def hook():
+        prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() != parent_pid:  # the parent died before prctl ran
+            os._exit(1)
+
+    return hook
 
 
 def _arecord_error(proc: subprocess.Popen, stderr_log) -> RuntimeError:
@@ -330,7 +361,13 @@ def record_until_stop() -> str:
 
     try:
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server_sock.bind(SOCKET_PATH)
+        # Bind under a tight umask, as the server does: connecting needs
+        # write permission, so this keeps other users out even in /tmp.
+        old_umask = os.umask(0o177)
+        try:
+            server_sock.bind(SOCKET_PATH)
+        finally:
+            os.umask(old_umask)
         server_sock.listen(1)
 
         recorder, stderr_log = _start_arecord(recording_path)

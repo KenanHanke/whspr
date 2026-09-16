@@ -2,9 +2,10 @@
 """
 Background transcription server for whspr.
 
-The server owns the Whisper model so that repeated dictations do not pay the
-model start-up cost every time.  It listens on a per-user Unix domain socket
-and answers newline-delimited JSON requests, one request per connection:
+The server owns the speech recognition model so that repeated dictations do
+not pay the model start-up cost every time.  It listens on a per-user Unix
+domain socket and answers newline-delimited JSON requests, one request per
+connection:
 
     {"type": "transcribe", "path": "/abs/audio.wav"}  ->  {"ok": true, "text": "..."}
     {"type": "stop"}                                  ->  {"ok": true}
@@ -21,9 +22,10 @@ Lifecycle:
   bound immediately at start-up while the model loads in a background thread,
   so clients can connect and queue work before the model is ready.
 * Transcriptions run sequentially on a single worker thread.
-* The server exits on a stop request, and automatically once it has gone
-  unused for `IDLE_TIMEOUT` seconds.  `transcribe()` transparently (re)starts
-  the server when needed, so the auto-shutdown is invisible to callers.
+* The server exits on a stop request (see `stop()`, or `whspr --stop-server`),
+  and automatically once it has gone unused for `IDLE_TIMEOUT` seconds.
+  `transcribe()` transparently (re)starts the server when needed, so either
+  shutdown is invisible to callers.
 """
 
 import fcntl
@@ -37,6 +39,7 @@ import sys
 import threading
 import time
 
+from ._parakeet import ParakeetModel
 from ._paths import runtime_file
 
 LOCK_PATH = runtime_file("whspr-server.lock")
@@ -59,6 +62,7 @@ _MAX_RECOVERIES = 3            # client: max mid-request server losses to retry 
 _SPAWN_RETRY_INTERVAL = 2.0    # client: min seconds between server spawn attempts
 _RESULT_TIMEOUT = 30 * 60.0    # client: max seconds to wait for a transcription result
 _STOP_TIMEOUT = 10.0           # client: max seconds to wait for a stop acknowledgement
+_STOP_POLL_INTERVAL = 0.05     # client: how often stop() re-checks the server
 _MAX_MESSAGE_BYTES = 8 * 1024 * 1024  # cap on a single protocol message
 
 # A job outliving every client's patience means a wedged native call (stuck
@@ -278,7 +282,8 @@ def _handle_connection(conn, state):
             return
 
         if request_type == "stop":
-            _try_send(conn, {"ok": True})
+            # The pid tells the client which lock holder to wait out.
+            _try_send(conn, {"ok": True, "pid": os.getpid()})
             state.stop_event.set()
             return
 
@@ -457,20 +462,32 @@ def _stop_legacy_server():
 
     Old servers used fixed /tmp paths and ran (holding the loaded model in
     memory) until explicitly stopped, so after an upgrade one could linger
-    until reboot.  Newer servers never use the legacy socket path.
+    until reboot.  Newer servers never use the legacy socket path.  Returns
+    whether a legacy server answered the stop request.
     """
-    if SOCKET_PATH == _LEGACY_SOCKET_PATH or not os.path.exists(_LEGACY_SOCKET_PATH):
-        return
+    if SOCKET_PATH == _LEGACY_SOCKET_PATH:
+        return False
+    try:
+        # The legacy path is machine-wide in sticky /tmp: a socket there that
+        # another user owns is not ours to stop, and one planted to answer
+        # slowly would otherwise stall every dictation's start().
+        if os.lstat(_LEGACY_SOCKET_PATH).st_uid != os.getuid():
+            return False
+    except OSError:
+        return False  # nothing there
+    stopped = False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.settimeout(2.0)
             conn.connect(_LEGACY_SOCKET_PATH)
             _send_message(conn, {"type": "stop"})
             _recv_message(conn)
+            stopped = True
     except (OSError, ValueError):
         pass  # no live legacy server; just clean up whatever is left
     _unlink_quietly(_LEGACY_SOCKET_PATH)
     _unlink_quietly(_LEGACY_LOCK_PATH)
+    return stopped
 
 
 def is_running():
@@ -488,14 +505,59 @@ def is_running():
 
 
 def stop():
-    """Ask a running server to shut down; a no-op if none is reachable."""
-    try:
-        response = _request({"type": "stop"}, _STOP_TIMEOUT)
-    except _ServerUnavailableError:
-        return
+    """Ask the running server to shut down; return whether one was running.
+
+    A no-op returning False if no server is running.  Otherwise this waits
+    (boundedly) until the server has let go of its lock and socket, so that
+    the next dictation starts a fresh server.  A transcription the server is
+    already working on still finishes and delivers its result, from the old
+    process, before that process exits; requests queued behind it are handed
+    over to a replacement server, as with any shutdown.
+    """
+    stopped_legacy = _stop_legacy_server()
+
+    deadline = time.monotonic() + _STOP_TIMEOUT
+    while True:
+        stopping_pid = _lock_holder_pid()
+        try:
+            response = _request({"type": "stop"}, _STOP_TIMEOUT)
+            break
+        except _ServerUnavailableError:
+            # The lock is taken just before the socket is bound, so a locked
+            # but unreachable server is normally one that is starting up.
+            if not is_running():
+                return stopped_legacy
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "a whspr server is running but does not accept requests"
+                ) from None
+            time.sleep(_STOP_POLL_INTERVAL)
     if not (isinstance(response, dict) and response.get("ok")):
         error = response.get("error") if isinstance(response, dict) else None
         raise RuntimeError(str(error or "failed to stop the whspr server"))
+    if isinstance(response.get("pid"), int):
+        stopping_pid = response["pid"]  # authoritative; older servers omit it
+
+    # The server lets go of its lock within one accept-loop poll.  A
+    # replacement may take the lock over right away (for a dictation queued
+    # during the shutdown), which the changed pid in the lock file reveals.
+    released_by = time.monotonic() + _STOP_TIMEOUT
+    while (
+        is_running()
+        and _lock_holder_pid() == stopping_pid
+        and time.monotonic() < released_by
+    ):
+        time.sleep(_STOP_POLL_INTERVAL)
+    return True
+
+
+def _lock_holder_pid():
+    """The pid a server recorded in the lock file, or None if unreadable."""
+    try:
+        with open(LOCK_PATH) as lock_file:
+            return int(lock_file.read().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def transcribe(path):
@@ -568,7 +630,9 @@ def _request(payload, reply_timeout):
         try:
             conn.connect(SOCKET_PATH)
             _send_message(conn, payload)
-        except (FileNotFoundError, ConnectionError, socket.timeout) as exc:
+        except (FileNotFoundError, ConnectionError, socket.timeout, BlockingIOError) as exc:
+            # BlockingIOError (EAGAIN) is how a Unix socket reports a full
+            # listen backlog, i.e. a live server momentarily behind on accepts.
             raise _ServerUnavailableError(str(exc)) from exc
 
         conn.settimeout(reply_timeout)
@@ -589,11 +653,13 @@ def _request(payload, reply_timeout):
 
 
 def load_model():
-    """Load the best Whisper model for this machine.
+    """Load the best speech recognition model for this machine.
 
-    The device is detected *before* any model files are fetched, so CPU-only
-    machines never download the much larger GPU model.  Already-downloaded
-    model files are used without hitting the network.
+    That is Whisper large-v3-turbo on a usable CUDA GPU, and NVIDIA's Parakeet
+    TDT 0.6B v3 on the CPU otherwise.  The device is detected *before* any
+    model files are fetched, so CPU-only machines never download the much
+    larger GPU model.  Already-downloaded model files are used without
+    hitting the network.
     """
     from ._cuda_bootstrap import ensure_cuda_runtime_loaded
 
@@ -613,7 +679,11 @@ def load_model():
                 f"whspr server: CUDA model unavailable ({exc}); using the CPU model",
                 file=sys.stderr,
             )
-    return _load_whisper_model("small", device="cpu", compute_type="int8")
+    return _load_cpu_model()
+
+
+def _load_cpu_model():
+    return ParakeetModel.load()
 
 
 def _cuda_is_usable():
@@ -658,10 +728,15 @@ def _warm_up(model):
 
 
 def transcribe_helper(path, model):
+    if isinstance(model, ParakeetModel):
+        # Parakeet does not invent phrases during silence the way Whisper
+        # does, so the filter below could only delete genuine speech.
+        return model.transcribe(path)
+
     segments, info = model.transcribe(path)
     text = "".join(seg.text for seg in segments)
 
-    # remove common hallucinations
+    # remove common Whisper hallucinations
     hallucinations = [
         "Thank you.",
         "Hello, I know I'll be right back.",
@@ -676,4 +751,10 @@ def transcribe_helper(path, model):
 
 
 if __name__ == "__main__":
+    # A normal exit on purpose: if the server stops during a first-run model
+    # download, the interpreter waits for huggingface_hub's download workers,
+    # so the file completes into the cache.  Cutting it short (os._exit)
+    # would strand the partial file there for good: its name is unique to
+    # this process, so no later download resumes or removes it.  The lock
+    # and socket are already released by then, so this delays nobody.
     sys.exit(main())

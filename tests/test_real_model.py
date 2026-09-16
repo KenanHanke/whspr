@@ -7,6 +7,7 @@ subprocess with an explicitly controlled environment.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -22,18 +23,36 @@ pytestmark = pytest.mark.real
 
 ENGLISH_TEXT = "The quick brown fox jumps over the lazy dog"
 GERMAN_TEXT = "Guten Morgen, heute scheint die Sonne und die Vögel singen"
+FRENCH_TEXT = "Bonjour, je voudrais réserver une table pour deux personnes ce soir"
+
+LONG_OPENING = "At the very beginning, a purple elephant walked into the room."
+LONG_FILLER = " ".join(
+    [
+        "Please send the quarterly report to the finance department by Friday.",
+        "The weather tomorrow will be sunny with a light breeze from the west.",
+        "Remember to water the plants and feed the cat before you leave.",
+        "Our meeting has been moved to three o'clock in the large conference room.",
+    ]
+)
+LONG_CLOSING = "At the very end, a green giraffe waved goodbye to everyone."
 
 # Loads the model exactly like the server would, transcribes one file, and
 # reports what happened as JSON on stdout.
 PROBE_PROGRAM = """
-import json, sys
+import json, resource, sys
 import whspr.server as server
+from whspr._parakeet import ParakeetModel
 
 model = server.load_model()
+if isinstance(model, ParakeetModel):
+    backend, device = "parakeet", "cpu"
+else:
+    backend, device = "whisper", model.model.device
 result = {
-    "device": model.model.device,
-    "multilingual": bool(model.model.is_multilingual),
+    "backend": backend,
+    "device": device,
     "text": server.transcribe_helper(sys.argv[1], model) if sys.argv[1] != "-" else "",
+    "max_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
 }
 print(json.dumps(result))
 """
@@ -64,15 +83,33 @@ def make_speech_wav(tmp_path, text, voice="en-us", name="speech.wav"):
     return str(path)
 
 
+def concatenate_wavs(paths, output):
+    import wave
+
+    with wave.open(output, "wb") as out:
+        for i, path in enumerate(paths):
+            with wave.open(path, "rb") as part:
+                if i == 0:
+                    out.setparams(part.getparams())
+                out.writeframes(part.readframes(part.getnframes()))
+
+
+def wav_seconds(path):
+    import wave
+
+    with wave.open(path, "rb") as wav:
+        return wav.getnframes() / wav.getframerate()
+
+
 def keywords_found(transcript, keywords, minimum):
     transcript = transcript.lower()
     return sum(1 for k in keywords if k.lower() in transcript) >= minimum
 
 
-def test_cpu_machine_loads_multilingual_small():
+def test_cpu_machine_loads_parakeet():
     probe = probe_load_model(cuda_visible="")
+    assert probe["backend"] == "parakeet"
     assert probe["device"] == "cpu"
-    assert probe["multilingual"] is True  # "small", not "small.en"
 
 
 def test_cpu_transcribes_english(tmp_path):
@@ -91,6 +128,113 @@ def test_cpu_transcribes_german_proving_multilingual(tmp_path):
     assert keywords_found(
         probe["text"], ["Morgen", "Sonne", "Vögel", "singen", "scheint"], 2
     ), probe["text"]
+
+
+def test_cpu_transcribes_french_detecting_the_language_itself(tmp_path):
+    wav = make_speech_wav(tmp_path, FRENCH_TEXT, voice="fr", name="french.wav")
+    probe = probe_load_model(wav=wav, cuda_visible="")
+    assert probe["backend"] == "parakeet"
+    assert keywords_found(
+        probe["text"], ["bonjour", "réserver", "table", "personnes", "soir"], 3
+    ), probe["text"]
+
+
+@pytest.mark.parametrize("peak_dbfs", [-55, -62])
+def test_cpu_transcribes_quiet_speech(tmp_path, peak_dbfs):
+    """Low microphone gain or a distant speaker: Parakeet garbles speech this
+    quiet unless it is amplified first (Whisper small coped with it)."""
+    import wave
+
+    import numpy as np
+    from faster_whisper import decode_audio
+
+    speech = decode_audio(make_speech_wav(tmp_path, ENGLISH_TEXT, voice="en-us"))
+    speech *= 10 ** (peak_dbfs / 20) / np.max(np.abs(speech))
+    path = tmp_path / "quiet.wav"
+    with wave.open(str(path), "wb") as wav:  # 16-bit, as arecord records it
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.round(speech * 32767).astype("<i2").tobytes())
+    probe = probe_load_model(wav=str(path), cuda_visible="")
+    assert keywords_found(probe["text"], ["quick", "brown", "fox", "lazy", "dog"], 3), (
+        probe["text"]
+    )
+
+
+def test_cpu_transcribes_silence_as_empty_text(tmp_path):
+    import wave
+
+    path = tmp_path / "silence.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 16000 * 3)
+    probe = probe_load_model(wav=str(path), cuda_visible="")
+    assert probe["text"] == ""
+
+
+def test_cpu_transcribes_a_recording_too_long_for_one_pass(tmp_path):
+    """Parakeet's encoder cannot take much more than 10 minutes in one pass
+    (and needs ~5 GB for 6 minutes), so a long dictation must be chunked:
+    every part must come through, in order, with bounded memory."""
+    opening = make_speech_wav(tmp_path, LONG_OPENING, name="opening.wav")
+    filler = make_speech_wav(tmp_path, LONG_FILLER, name="filler.wav")
+    closing = make_speech_wav(tmp_path, LONG_CLOSING, name="closing.wav")
+    long_wav = str(tmp_path / "long.wav")
+    concatenate_wavs([opening] + [filler] * 40 + [closing], long_wav)
+    assert wav_seconds(long_wav) > 12 * 60
+
+    probe = probe_load_model(wav=long_wav, cuda_visible="")
+
+    text = probe["text"].lower()
+    assert "purple elephant" in text[:300], text[:300]
+    assert "green giraffe" in text[-300:], text[-300:]
+    assert text.index("purple elephant") < text.index("green giraffe")
+    assert 36 <= text.count("quarterly report") <= 40  # nothing lost or doubled
+    assert probe["max_rss_mb"] < 3000, probe["max_rss_mb"]
+
+
+def test_library_api_transcribes_compressed_audio_on_cpu(tmp_path):
+    """`whspr.transcribe()` accepts any audio format, as with Whisper."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg is needed to create the compressed test file")
+    wav = make_speech_wav(tmp_path, ENGLISH_TEXT, voice="en-us")
+    mp3 = str(tmp_path / "speech.mp3")
+    subprocess.run(["ffmpeg", "-v", "error", "-i", wav, mp3], check=True)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys, whspr; print(whspr.transcribe(sys.argv[1]))", mp3],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr
+    assert keywords_found(result.stdout, ["quick", "brown", "fox", "lazy", "dog"], 3), (
+        result.stdout
+    )
+
+
+def test_cpu_model_works_without_the_gpu_extras(tmp_path):
+    """Installs without [gpu] have no `nvidia` package; the real CPU model
+    must load and transcribe regardless."""
+    from test_server_units import BLOCK_NVIDIA_PREAMBLE
+
+    program = BLOCK_NVIDIA_PREAMBLE + (
+        "import whspr.server as server\n"
+        "model = server.load_model()\n"
+        "print(server.transcribe_helper(sys.argv[1], model))\n"
+    )
+    wav = make_speech_wav(tmp_path, ENGLISH_TEXT, voice="en-us")
+    result = subprocess.run(
+        [sys.executable, "-c", program, wav], capture_output=True, text=True, timeout=600
+    )
+    assert result.returncode == 0, result.stderr
+    assert keywords_found(result.stdout, ["quick", "brown", "fox", "lazy", "dog"], 3), (
+        result.stdout
+    )
 
 
 def test_gpu_machine_uses_turbo_or_falls_back_cleanly(tmp_path):

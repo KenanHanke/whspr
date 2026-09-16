@@ -1,17 +1,20 @@
 # whspr
 
-A minimalist dictation tool for local speech recognition using OpenAI's Whisper models.
-Its interface is fully keyboard-driven and sound-based so as not to interfere with
-windowing or application focus.
+A minimalist dictation tool for local speech recognition using OpenAI's Whisper and
+NVIDIA's Parakeet models. Its interface is fully keyboard-driven and sound-based so as
+not to interfere with windowing or application focus.
 
-Processing is done locally using `faster-whisper`. If `whspr[gpu]` optional dependencies
-are installed and an Nvidia GPU is available, the model `whisper-large-v3-turbo`
-will be used; otherwise, `whisper-small` will be used. `whspr` is currently only
-available on Linux and can be installed from [PyPI](https://pypi.org/project/whspr/).
+Processing is done locally. If `whspr[gpu]` optional dependencies are installed and an
+Nvidia GPU is available, the model `whisper-large-v3-turbo` will be used via `faster-whisper`;
+otherwise, [`parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+will be run on the CPU via `onnx-asr`. `whspr` is currently only available on Linux and
+can be installed from [PyPI](https://pypi.org/project/whspr/).
 
 Transcription happens in a background server process that keeps the model warm
 between dictations and shuts itself down automatically after five minutes of
 inactivity; it is started (and restarted) on demand, so this is invisible in use.
+To free the model's memory without waiting that long, stop the server with
+`whspr --stop-server`.
 
 ## Usage
 
@@ -28,6 +31,14 @@ result to the clipboard. The difference is that `Super+V` will additionally past
 into the currently focussed application. `Super+X` will cancel any dictation currently in progress.
 Sounds will indicate when `whspr` is listening and when it has finished processing.
 
+The background server can also be stopped from the command line before its five minutes
+of inactivity have passed; a transcription that is already underway still completes, and
+the next dictation starts the server again:
+
+```bash
+whspr --stop-server
+```
+
 `whspr` can also be accessed from within Python:
 
 ```python
@@ -39,6 +50,7 @@ result = transcribe("path/to/audio.mp3")
 
 `whspr` depends on:
 
+- Python 3.10 or newer.
 - the `aplay`, `arecord`, `ydotool` commands. The former two are part of the
   `alsa-utils` package and installed on most distros by default. `ydotool` is optional
   and only required for the `--paste` flag (see [Usage](#usage)).
