@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "whspr"
-version = "1.2.0"
+version = "1.2.1"
 authors = [{ name = "Kenan Hanke" }]
 description = "An interactive dictation tool for local speech recognition using Whisper and Parakeet models."
 readme = "README.md"
@@ -14,7 +14,15 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 # onnx-asr is pre-1.0, so it is pinned to the minor version tested with whspr.
-dependencies = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.12,<0.13", "numpy", "pyperclip"]
+# onnxruntime 1.21 and older reject the CPU model's 8-bit MatMulNBits weights
+# ("Exception during initialization" in matmul_nbits.cc), hence the floor.
+dependencies = [
+    "faster-whisper>=1.1,<2",
+    "onnx-asr[cpu,hub]>=0.12,<0.13",
+    "onnxruntime>=1.22",
+    "numpy",
+    "pyperclip",
+]
 classifiers = ["Operating System :: POSIX :: Linux"]
 
 [project.urls]

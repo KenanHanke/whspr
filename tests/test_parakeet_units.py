@@ -59,9 +59,11 @@ def test_tiny_overhang_is_not_left_as_its_own_chunk():
 
 
 def test_cuts_land_in_pauses():
-    # Continuous "speech" with a single short pause inside each search window.
-    audio = noise(170)
-    pauses = [52.0, 104.5, 158.0]  # seconds
+    # Continuous "speech" with a single short pause inside each search window,
+    # placed a little before each chunk limit.
+    limit = parakeet._MAX_CHUNK_SECONDS
+    pauses = [limit - 8.0, 2 * limit - 15.5, 3 * limit - 22.0]
+    audio = noise(pauses[-1] + 12.0)
     for pause in pauses:
         begin = int(pause * RATE)
         audio[begin : begin + int(0.4 * RATE)] = 0.0
@@ -77,12 +79,13 @@ def test_cuts_land_in_pauses():
 def test_very_long_recording_splits_validly_and_quickly():
     import time
 
-    audio = noise(45 * 60)  # a 45-minute dictation
+    minutes = 45
+    audio = noise(minutes * 60)  # a 45-minute dictation
     started = time.monotonic()
     chunks = split_audio(audio)
     assert time.monotonic() - started < 5.0
     assert_valid_split(audio, chunks)
-    assert len(chunks) >= 45
+    assert len(chunks) >= minutes * 60 / parakeet._MAX_CHUNK_SECONDS
 
 
 def test_digital_silence_splits_validly():
@@ -125,17 +128,20 @@ def write_wav(path, samples, rate=RATE, channels=1):
     return str(path)
 
 
+THREE_CHUNKS_SECONDS = 2 * parakeet._MAX_CHUNK_SECONDS + 10.0
+
+
 def test_transcribe_joins_chunk_texts_with_single_spaces(tmp_path):
-    path = write_wav(tmp_path / "long.wav", noise(130))
+    path = write_wav(tmp_path / "long.wav", noise(THREE_CHUNKS_SECONDS))
     asr = FakeAsr()
     assert ParakeetModel(asr).transcribe(path) == "chunk1 chunk2 chunk3"
     assert len(asr.calls) == 3
     assert all(n <= MAX for n in asr.calls)
-    assert sum(asr.calls) == 130 * RATE
+    assert sum(asr.calls) == int(THREE_CHUNKS_SECONDS * RATE)
 
 
 def test_transcribe_skips_empty_chunk_results(tmp_path):
-    path = write_wav(tmp_path / "long.wav", noise(130))
+    path = write_wav(tmp_path / "long.wav", noise(THREE_CHUNKS_SECONDS))
     asr = FakeAsr(replies=["  First.", "   ", "Third. "])
     assert ParakeetModel(asr).transcribe(path) == "First. Third."
 

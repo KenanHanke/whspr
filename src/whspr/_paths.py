@@ -4,6 +4,14 @@
 import os
 
 
+def runtime_dir():
+    """Return the directory whspr keeps per-user runtime files in."""
+    directory = os.environ.get("XDG_RUNTIME_DIR")
+    if directory and os.path.isdir(directory):
+        return directory
+    return "/tmp"
+
+
 def runtime_file(name):
     """Return a per-user path for a whspr runtime file (socket, lock, ...).
 

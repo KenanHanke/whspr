@@ -105,6 +105,17 @@ def test_runtime_paths_ignore_nonexistent_xdg_dir(monkeypatch):
     assert runtime_file("whspr-server.lock") == expected
 
 
+def test_runtime_dir_prefers_xdg_and_falls_back_to_tmp(tmp_path, monkeypatch):
+    from whspr._paths import runtime_dir
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert runtime_dir() == str(tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/no/such/directory/for/sure")
+    assert runtime_dir() == "/tmp"
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert runtime_dir() == "/tmp"
+
+
 def test_client_paths_are_per_user():
     import whspr.client as client
 
@@ -164,32 +175,168 @@ def test_load_model_uses_parakeet_on_cpu(monkeypatch, no_cuda_bootstrap, fake_cp
     assert model is CPU_MODEL
 
 
-def test_cpu_model_is_int8_parakeet_tdt_v3_on_the_cpu_provider(monkeypatch):
+def fake_repo(root, files):
+    """Create a stand-in for a downloaded repo snapshot."""
+    for name in files:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(name)
+    return str(root)
+
+
+def test_cpu_model_is_the_block_quantized_parakeet_on_the_cpu_provider(
+    tmp_path, monkeypatch
+):
+    import huggingface_hub
     import onnx_asr
 
+    import whspr._parakeet as parakeet
     from whspr._parakeet import ParakeetModel
+
+    # The repo keeps weights in a subfolder, vocabulary and config at the root.
+    snapshot = fake_repo(tmp_path / "snapshot", parakeet.MODEL_FILES)
+    downloads = []
+
+    def fake_snapshot_download(repo, revision=None, allow_patterns=None, local_files_only=False):
+        downloads.append((repo, revision, tuple(allow_patterns or ()), local_files_only))
+        return snapshot
 
     calls = []
 
-    def fake_load_model(name, **kwargs):
-        calls.append((name, kwargs))
+    def fake_load_model(model_type, path=None, **kwargs):
+        # The directory must be resolvable while the model is being loaded.
+        contents = {name: os.path.realpath(os.path.join(path, name)) for name in os.listdir(path)}
+        calls.append((model_type, path, contents, kwargs))
         return "fake-asr"
 
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
     monkeypatch.setattr(onnx_asr, "load_model", fake_load_model)
     model = server._load_cpu_model()
 
     assert isinstance(model, ParakeetModel)
-    [(name, kwargs)] = calls
-    assert name == "nemo-parakeet-tdt-0.6b-v3"
+    assert downloads == [
+        (
+            "Olicorne/parakeet-tdt-0.6b-v3-optimized-onnx",
+            parakeet.MODEL_REVISION,  # pinned, not whatever main points at
+            parakeet.MODEL_FILES,
+            True,  # the cache is used before the network
+        )
+    ]
+
+    [(model_type, path, contents, kwargs)] = calls
+    assert model_type == "nemo-conformer-tdt"
     assert kwargs["quantization"] == "int8"
     assert kwargs["providers"] == ["CPUExecutionProvider"]
     assert kwargs["resampler_config"]["providers"] == ["CPUExecutionProvider"]
+    # Everything the model needs, gathered into the one directory onnx-asr
+    # resolves from, and pointing at the downloaded files.
+    assert contents == {
+        "encoder-model.int8.onnx": os.path.join(snapshot, "int8/encoder-model.int8.onnx"),
+        "decoder_joint-model.int8.onnx": os.path.join(snapshot, "int8/decoder_joint-model.int8.onnx"),
+        "vocab.txt": os.path.join(snapshot, "vocab.txt"),
+        "config.json": os.path.join(snapshot, "config.json"),
+    }
+    assert not os.path.exists(path)  # and cleaned up once loaded
 
     options = kwargs["sess_options"]
     assert 1 <= options.intra_op_num_threads <= 8  # not one per core
     assert options.get_session_config_entry("session.intra_op.allow_spinning") == "0"
     assert options.enable_cpu_mem_arena is False
     assert kwargs["resampler_config"]["sess_options"].intra_op_num_threads == 1
+
+
+def test_cpu_model_links_live_in_the_runtime_dir(tmp_path, monkeypatch):
+    """A load killed before its cleanup must not litter /tmp for good."""
+    import whspr._parakeet as parakeet
+
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    snapshot = fake_repo(tmp_path / "snapshot", parakeet.MODEL_FILES)
+
+    links = parakeet._link_model_files(snapshot)
+    try:
+        assert os.path.dirname(links) == str(runtime)
+    finally:
+        import shutil
+
+        shutil.rmtree(links, ignore_errors=True)
+
+
+def test_cpu_model_download_falls_back_to_the_network(tmp_path, monkeypatch):
+    """A cold cache raises FileNotFoundError for a cache-only lookup; the
+    model must then be fetched rather than the load failing."""
+    import huggingface_hub
+
+    import whspr._parakeet as parakeet
+
+    complete = fake_repo(tmp_path / "complete", parakeet.MODEL_FILES)
+    attempts = []
+
+    def fake_snapshot_download(repo, revision=None, allow_patterns=None, local_files_only=False):
+        attempts.append(local_files_only)
+        if local_files_only:
+            raise huggingface_hub.errors.LocalEntryNotFoundError("cold cache")
+        return complete
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    assert parakeet._download_model() == complete
+    assert attempts == [True, False]
+
+
+def test_cpu_model_download_repairs_a_half_downloaded_cache(tmp_path, monkeypatch):
+    """An interrupted first download can leave a snapshot that the cache-only
+    lookup returns happily, minus the 900 MB encoder.  That must be fetched,
+    not turned into a permanent failure of every later dictation."""
+    import huggingface_hub
+
+    import whspr._parakeet as parakeet
+
+    partial = fake_repo(tmp_path / "partial", parakeet.MODEL_FILES[1:])  # no encoder
+    complete = fake_repo(tmp_path / "complete", parakeet.MODEL_FILES)
+    attempts = []
+
+    def fake_snapshot_download(repo, revision=None, allow_patterns=None, local_files_only=False):
+        attempts.append(local_files_only)
+        return partial if local_files_only else complete
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    assert parakeet._download_model() == complete
+    assert attempts == [True, False]
+
+
+def test_cpu_model_load_reports_a_file_missing_after_downloading(tmp_path, monkeypatch):
+    """Only once downloading has not produced the file is it the repo's
+    fault; the failure must name the file rather than fail obscurely."""
+    import huggingface_hub
+
+    import whspr._parakeet as parakeet
+
+    partial = fake_repo(tmp_path / "partial", parakeet.MODEL_FILES[1:])
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download", lambda *a, **k: partial
+    )
+    with pytest.raises(FileNotFoundError, match="missing int8/encoder-model"):
+        server._load_cpu_model()
+
+
+def test_cpu_model_load_cleans_up_its_link_directory_on_failure(tmp_path, monkeypatch):
+    import huggingface_hub
+    import onnx_asr
+
+    import whspr._parakeet as parakeet
+
+    snapshot = fake_repo(tmp_path / "snapshot", parakeet.MODEL_FILES)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **k: snapshot)
+    made = []
+
+    def exploding_load_model(model_type, path=None, **kwargs):
+        made.append(path)
+        raise RuntimeError("corrupt model file")
+
+    monkeypatch.setattr(onnx_asr, "load_model", exploding_load_model)
+    with pytest.raises(RuntimeError, match="corrupt model file"):
+        server._load_cpu_model()
+    assert made and not os.path.exists(made[0])  # no leftover directory
 
 
 def test_library_api_loads_the_model_once_under_concurrent_first_calls(monkeypatch):

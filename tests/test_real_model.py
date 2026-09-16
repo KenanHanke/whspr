@@ -176,9 +176,10 @@ def test_cpu_transcribes_silence_as_empty_text(tmp_path):
 
 
 def test_cpu_transcribes_a_recording_too_long_for_one_pass(tmp_path):
-    """Parakeet's encoder cannot take much more than 10 minutes in one pass
-    (and needs ~5 GB for 6 minutes), so a long dictation must be chunked:
-    every part must come through, in order, with bounded memory."""
+    """Parakeet's encoder attends over the whole input at once, so a single
+    pass over this recording would need well over 10 GB; a long dictation
+    must be chunked, with every part coming through, in order, in bounded
+    memory."""
     opening = make_speech_wav(tmp_path, LONG_OPENING, name="opening.wav")
     filler = make_speech_wav(tmp_path, LONG_FILLER, name="filler.wav")
     closing = make_speech_wav(tmp_path, LONG_CLOSING, name="closing.wav")
@@ -193,7 +194,10 @@ def test_cpu_transcribes_a_recording_too_long_for_one_pass(tmp_path):
     assert "green giraffe" in text[-300:], text[-300:]
     assert text.index("purple elephant") < text.index("green giraffe")
     assert 36 <= text.count("quarterly report") <= 40  # nothing lost or doubled
-    assert probe["max_rss_mb"] < 3000, probe["max_rss_mb"]
+    # Far under a single pass (>10 GB), and near what one chunk alone costs
+    # (~3 GB here); the margin allows for machines with more cores, whose
+    # intra-op buffers are larger.
+    assert probe["max_rss_mb"] < 5000, probe["max_rss_mb"]
 
 
 def test_library_api_transcribes_compressed_audio_on_cpu(tmp_path):
